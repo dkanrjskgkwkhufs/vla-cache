@@ -3,25 +3,37 @@ run_libero_eval.py  (VLA-Cache + SP-VLA Step Skipping)
 
 VLA-Cache(토큰 KV 재사용) 평가 스크립트에 SP-VLA의 action 재사용(step skipping)을 추가한 버전.
 
-  - use_vla_cache : 모델을 돌릴 때 정적 토큰의 KV를 재사용 (VLA-Cache)
-  - use_step_skip : 평면 이동 구간에서는 모델을 건너뛰고 ridge regression으로 action 예측 (SP-VLA)
+  - use_vla_cache     : 모델을 돌릴 때 정적 토큰의 KV를 재사용 (VLA-Cache)
+  - use_step_skip     : 평면 이동 구간에서는 모델을 건너뛰고 ridge regression으로 action 예측 (SP-VLA)
+  - output_attentions : 캐시를 끈 기준선에서만 의미 있음 (False = B0, True = B1)
+  - fork_profiling    : transformers 포크의 LlamaModel.forward 안 synchronize / CUDA 이벤트 / print 사용 여부
+                        (기본 False = 끔. 이 동기화가 측정 latency를 부풀리기 때문)
 
-핵심 변경점
-  1) ActionScheduler 클래스 추가 (SP-VLA modeling_prismatic.py의 save_actions / skip 조건 / fit_next_action 이식)
-  2) prev_img = "직전 env 프레임"이 아니라 "마지막으로 모델을 돌린 프레임"
-     → last_caches(KV, attention)가 만들어진 프레임과 비교 기준 프레임을 일치시킴
-  3) skip한 스텝에서는 last_caches / last_infer_img 를 갱신하지 않음
-  4) skip rate, 추론 스텝 수, 재사용 토큰 수, latency 로깅
+측정 지표 (summary.json)
+  [정확도]   success_rate, per_task_success
+  [action 재사용]
+             policy_steps / infer_steps / skip_steps / skip_rate   모델 호출 수와 건너뛴 수
+  [KV 재사용]
+             cache_hit_infers            재사용이 실제로 적용된 추론 횟수
+             avg_reuse_candidates        추론당 재사용 후보 토큰 수 (이미지 토큰 256개 중)
+             avg_reused_tokens_by_layer  레이어별 실제 재사용 토큰 수의 평균 (레이어 비율 적용 후)
+             vision_token_compute_skip_ratio
+                                         이미지 토큰 x 레이어 계산 중 생략한 비율
+  [속도]     avg_infer_latency_ms        VLA 1회 호출 (get_action 앞뒤 동기화 + perf_counter)
+             avg_prefill_ms              LLM 프리필 (CUDA 이벤트, 추가 동기화 없음)
+             avg_policy_latency_ms       skip 포함 스텝당 평균
+             policy_hz                   1000 / avg_policy_latency_ms
+  [기타]     peak_gpu_mem_gb, total_episode_time_s
 
 Usage:
-    # 4가지 조합 비교
-    python experiments/robot/libero/run_libero_eval.py --use_vla_cache False --use_step_skip False   # baseline
-    python experiments/robot/libero/run_libero_eval.py --use_vla_cache True  --use_step_skip False   # cache only
-    python experiments/robot/libero/run_libero_eval.py --use_vla_cache False --use_step_skip True    # skip only
-    python experiments/robot/libero/run_libero_eval.py --use_vla_cache True  --use_step_skip True    # cache + skip
+    COMMON="--pretrained_checkpoint checkpoints/openvla-7b-finetuned-libero-spatial --save_video False"
+    python experiments/robot/libero/run_libero_eval.py $COMMON --use_vla_cache False --output_attentions False --use_step_skip False  # B0
+    python experiments/robot/libero/run_libero_eval.py $COMMON --use_vla_cache False --output_attentions True  --use_step_skip False  # B1
+    python experiments/robot/libero/run_libero_eval.py $COMMON --use_vla_cache True  --use_step_skip False                            # V
+    python experiments/robot/libero/run_libero_eval.py $COMMON --use_vla_cache False --output_attentions False --use_step_skip True   # B0+skip
+    python experiments/robot/libero/run_libero_eval.py $COMMON --use_vla_cache True  --use_step_skip True                             # V+skip
 """
 
-import copy
 import json
 import os
 import sys
@@ -76,6 +88,8 @@ MAX_STEPS = {
     "libero_90": 400,       # longest training demo has 373 steps
 }
 
+NUM_VISION_TOKENS = 256     # OpenVLA: 224x224 이미지 → 16x16 패치
+
 
 @dataclass
 class GenerateConfig:
@@ -86,6 +100,8 @@ class GenerateConfig:
     #################################################################################################################
     use_vla_cache: bool = True                       # VLA-Cache: 정적 토큰 KV 재사용
     use_step_skip: bool = True                       # SP-VLA: action 재사용 (step skipping)
+    output_attentions: bool = True                   # 캐시를 끈 경우만 의미 있음 (False=B0, True=B1). openvla_utils.py 수정본 필요
+    fork_profiling: bool = False                     # transformers 포크 안의 synchronize/print 사용 (False 권장)
 
     # Step skipping 하이퍼파라미터 (None이면 SKIP_PARAMS의 suite 기본값 사용)
     z_xy_rate_skip: Optional[float] = None           # max|z| / max(|x|,|y|) < 이 값이어야 skip
@@ -202,6 +218,106 @@ class ActionScheduler:
         return np.hstack([next_xyz, total[-1, 3:]])
 
 
+def disable_fork_profiling():
+    """
+    VLA-Cache transformers 포크의 LlamaModel.forward에는 측정용 코드가 들어 있다.
+      - forward 시작마다 torch.cuda.synchronize()          (프리필 1회 + 디코드 6회 = 스텝당 7회)
+      - 프리필 끝에 torch.cuda.synchronize() + CUDA 이벤트 시간 계산 + print
+    CPU가 GPU를 기다리게 만들어 측정 latency를 부풀리므로, 이 모듈 안에서만 해당 호출을 무력화한다.
+    (포크 파일은 수정하지 않는다. 다른 모듈의 torch.cuda.synchronize는 그대로 동작한다.)
+    """
+    import transformers.models.llama.modeling_llama as ml
+
+    class _NoopEvent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def record(self, *args, **kwargs):
+            pass
+
+        def elapsed_time(self, other):
+            return 0.0
+
+    class _CudaProxy:
+        Event = _NoopEvent
+
+        @staticmethod
+        def synchronize(*args, **kwargs):
+            pass
+
+        def __getattr__(self, name):
+            return getattr(torch.cuda, name)
+
+    class _TorchProxy:
+        cuda = _CudaProxy()
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    ml.torch = _TorchProxy()
+    ml.print = lambda *args, **kwargs: None
+
+
+class PrefillTimer:
+    """LLM 프리필(입력 길이 > 1인 forward)을 CUDA 이벤트로 잰다. 이벤트만 기록하고 동기화는 하지 않는다."""
+
+    def __init__(self, vla):
+        self.enabled = torch.cuda.is_available()
+        self.pairs = []
+        self._start = None
+        if self.enabled:
+            llm = vla.language_model.model
+            llm.register_forward_pre_hook(self._pre, with_kwargs=True)
+            llm.register_forward_hook(self._post, with_kwargs=True)
+
+    def _pre(self, m, args, kwargs):
+        x = kwargs.get("inputs_embeds")
+        if x is None:
+            x = kwargs.get("input_ids")
+        if x is not None and x.shape[1] > 1:
+            self._start = torch.cuda.Event(enable_timing=True)
+            self._start.record()
+
+    def _post(self, m, args, kwargs, out):
+        if self._start is not None:
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self.pairs.append((self._start, end))
+            self._start = None
+
+    def pop_ms(self):
+        """스텝이 끝나고 이미 동기화된 뒤에 호출한다."""
+        ms = sum(s.elapsed_time(e) for s, e in self.pairs) if self.pairs else 0.0
+        self.pairs = []
+        return ms
+
+
+def reused_tokens_by_layer(vla):
+    """
+    이번 추론에서 레이어별로 실제 재사용된(계산을 생략한) 이미지 토큰 수.
+    transformers 포크 LlamaModel.forward의 규칙을 그대로 따른다:
+      - 재사용은 pruning_loc 레이어(2, 6, 9, 11)에서만 적용
+      - 그 레이어의 개수 = max(1, int(proportion[layer] * 후보 수)), 이전보다 크거나 같을 때만 늘어남
+      - 한 번 생략한 토큰은 이후 레이어에서도 계속 생략
+    재사용이 없으면 None.
+    """
+    lm_cfg = vla.language_model.config
+    prop = getattr(lm_cfg, "proportion_attn_var", None)
+    patches = getattr(lm_cfg, "reusable_patches", None)
+    if prop is None or patches is None:
+        return None
+    prop = prop.tolist() if hasattr(prop, "tolist") else list(prop)
+    llm = vla.language_model.model
+    pruning_loc = set(getattr(llm, "pruning_loc", [2, 6, 9, 11]))
+    n_cand = len(patches)
+    cur, per_layer = 0, []
+    for layer_idx in range(len(llm.layers)):
+        if layer_idx in pruning_loc and layer_idx < len(prop):
+            cur = max(cur, max(1, int(prop[layer_idx] * n_cand)))
+        per_layer.append(cur)
+    return n_cand, per_layer
+
+
 def cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -229,6 +345,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if cfg.step_skip is None:
         cfg.step_skip = defaults["step_skip"]
 
+    # 포크 안의 측정용 동기화 끄기
+    if not cfg.fork_profiling:
+        disable_fork_profiling()
+
     # Load model
     model = get_model(cfg)
 
@@ -250,10 +370,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
         buffer_size=cfg.action_buffer_size,
         min_generate_ratio=cfg.min_generate_ratio,
     )
+    prefill_timer = PrefillTimer(model)
+    num_layers = len(model.language_model.model.layers)
+
+    # 방법 이름: B0 = 캐시 끔+어텐션 끔, B1 = 캐시 끔+어텐션 켬, V = VLA-Cache
+    mode = "V" if cfg.use_vla_cache else ("B1" if cfg.output_attentions else "B0")
+    if cfg.use_step_skip:
+        mode += "+skip"
 
     # Initialize local logging
-    mode = f"cache{int(cfg.use_vla_cache)}-skip{int(cfg.use_step_skip)}"
-    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{mode}-{DATE_TIME}"
+    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{mode.replace('+', '_')}-{DATE_TIME}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
     os.makedirs(cfg.local_log_dir, exist_ok=True)
@@ -279,14 +405,19 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # 전체 통계
     total_episodes, total_successes = 0, 0
+    per_task_success = {}
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     stats = {
         "policy_steps": 0,        # 정책이 action을 낸 스텝 수 (= infer + skip)
         "infer_steps": 0,         # VLA를 실제로 돌린 스텝 수
-        "skip_steps": 0,          # ridge regression으로 대체한 스텝 수
+        "skip_steps": 0,          # ridge regression으로 대체한 스텝 수 (action 재사용)
         "infer_time": 0.0,        # VLA 호출 총 시간 (get_action, 토큰 선택 포함)
         "skip_time": 0.0,         # skip 예측 총 시간
-        "reused_tokens": 0,       # 재사용 후보 토큰 수 합 (레이어 비율 적용 전)
-        "cache_steps": 0,         # 재사용이 실제로 걸린 추론 스텝 수
+        "prefill_time_ms": 0.0,   # LLM 프리필 총 시간 (CUDA 이벤트)
+        "cache_hit_infers": 0,    # KV 재사용이 실제로 적용된 추론 수
+        "reuse_candidates": 0,    # 재사용 후보 토큰 수 합
+        "reused_token_layers": 0, # 레이어별 실제 재사용 토큰 수의 합 (토큰 x 레이어)
         "episode_time": 0.0,      # 에피소드 wall-clock (sim 포함)
     }
 
@@ -311,7 +442,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             last_caches = None       # 마지막 추론에서 나온 {past_key_values, attentions}
             last_infer_img = None    # last_caches를 만든 프레임 (VLA-Cache 비교 기준)
             scheduler.reset()
-            ep_infer_time, ep_reused = 0.0, 0
+            ep_infer_time, ep_cache_hits, ep_candidates, ep_reused_tl = 0.0, 0, 0, 0
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
@@ -347,6 +478,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             ),
                         }
 
+                        # 스텝 latency: 시작 전 / 끝난 후 1번씩만 동기화 (이 값이 기준 측정)
                         cuda_sync()
                         s = time.perf_counter()
                         action, last_caches, result_image = get_action(
@@ -359,14 +491,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         )
                         cuda_sync()
                         ep_infer_time += time.perf_counter() - s
+                        stats["prefill_time_ms"] += prefill_timer.pop_ms()
 
-                        # 이번 추론에서 재사용된 토큰 수 (get_vla_action이 config에 기록)
-                        lm_cfg = model.language_model.config
-                        if cfg.use_vla_cache and getattr(lm_cfg, "proportion_attn_var", None) is not None:
-                            patches = getattr(lm_cfg, "reusable_patches", None)
-                            if patches is not None:
-                                ep_reused += len(patches)
-                                stats["cache_steps"] += 1
+                        # 이번 추론의 KV 재사용 (get_vla_action이 config에 기록)
+                        if cfg.use_vla_cache:
+                            reuse = reused_tokens_by_layer(model)
+                            if reuse is not None:
+                                n_cand, per_layer = reuse
+                                ep_cache_hits += 1
+                                ep_candidates += n_cand
+                                ep_reused_tl += sum(per_layer)
 
                         last_infer_img = img
                         # normalize_gripper_action은 in-place로 바꾸므로 반드시 복사본을 저장
@@ -406,15 +540,19 @@ def eval_libero(cfg: GenerateConfig) -> None:
             stats["infer_steps"] += n_inf
             stats["skip_steps"] += n_skip
             stats["infer_time"] += ep_infer_time
-            stats["reused_tokens"] += ep_reused
+            stats["cache_hit_infers"] += ep_cache_hits
+            stats["reuse_candidates"] += ep_candidates
+            stats["reused_token_layers"] += ep_reused_tl
             stats["episode_time"] += ep_time
 
             ep_skip_rate = n_skip / max(n_pol, 1) * 100
             ep_infer_ms = ep_infer_time / max(n_inf, 1) * 1000
             ep_msg = (
-                f"[episode] success={done} policy_steps={n_pol} infer={n_inf} skip={n_skip} "
-                f"skip_rate={ep_skip_rate:.1f}% avg_infer={ep_infer_ms:.1f}ms "
-                f"avg_reused_tokens={ep_reused / max(n_inf, 1):.1f} ep_time={ep_time:.1f}s"
+                f"[episode] success={done} steps={n_pol} infer={n_inf} action_skip={n_skip} "
+                f"({ep_skip_rate:.1f}%) | kv_reuse_infers={ep_cache_hits} "
+                f"avg_candidates={ep_candidates / max(ep_cache_hits, 1):.1f} "
+                f"avg_reused_by_layer={ep_reused_tl / max(ep_cache_hits, 1) / num_layers:.1f} "
+                f"| avg_infer={ep_infer_ms:.1f}ms ep_time={ep_time:.1f}s"
             )
 
             if cfg.save_video:
@@ -444,6 +582,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
         log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
         log_file.flush()
+        per_task_success[task_description] = float(task_successes) / float(task_episodes)
         if cfg.use_wandb:
             wandb.log({
                 f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
@@ -452,21 +591,41 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # ===== 최종 요약 =====
     P, I = max(stats["policy_steps"], 1), max(stats["infer_steps"], 1)
+    H = max(stats["cache_hit_infers"], 1)
+    avg_policy_ms = (stats["infer_time"] + stats["skip_time"]) / P * 1000
     summary = {
         "mode": mode,
+        "fork_profiling": cfg.fork_profiling,
+
+        # 정확도
         "success_rate": total_successes / max(total_episodes, 1),
         "episodes": total_episodes,
+
+        # action 재사용 (SP-VLA)
         "policy_steps": stats["policy_steps"],
         "infer_steps": stats["infer_steps"],
         "skip_steps": stats["skip_steps"],
         "skip_rate": stats["skip_steps"] / P,
-        "avg_infer_latency_ms": stats["infer_time"] / I * 1000,                               # VLA 1회 호출
-        "avg_policy_latency_ms": (stats["infer_time"] + stats["skip_time"]) / P * 1000,       # 스텝당 (skip 포함)
-        "avg_reused_tokens_per_infer": stats["reused_tokens"] / I,
-        "cache_hit_infer_ratio": stats["cache_steps"] / I,
-        "policy_hz": P / max(stats["infer_time"] + stats["skip_time"], 1e-9),
+
+        # KV 재사용 (VLA-Cache)
+        "cache_hit_infers": stats["cache_hit_infers"],
+        "avg_reuse_candidates": stats["reuse_candidates"] / H,
+        "avg_reused_tokens_by_layer": stats["reused_token_layers"] / H / num_layers,
+        "vision_token_compute_skip_ratio": stats["reused_token_layers"] / (I * NUM_VISION_TOKENS * num_layers),
+
+        # 속도
+        "avg_infer_latency_ms": stats["infer_time"] / I * 1000,      # VLA 1회 호출
+        "avg_prefill_ms": stats["prefill_time_ms"] / I,              # LLM 프리필
+        "avg_policy_latency_ms": avg_policy_ms,                      # 스텝당 (skip 포함)
+        "policy_hz": 1000 / avg_policy_ms if avg_policy_ms > 0 else None,
+
+        # 기타
         "total_episode_time_s": stats["episode_time"],
     }
+    if torch.cuda.is_available():
+        summary["peak_gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 1024**3
+    summary["per_task_success"] = per_task_success
+
     print("\n===== SUMMARY =====")
     for k, v in summary.items():
         print(f"{k}: {v}")
