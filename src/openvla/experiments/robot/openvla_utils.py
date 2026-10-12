@@ -404,7 +404,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
 
             vla.language_model.config.reusable_patches = mask_indices
-            vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn) if mask_indices is not None else None
 
     else:
         print(">> VLA-Cache disabled")
