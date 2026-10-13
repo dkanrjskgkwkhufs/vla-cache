@@ -523,7 +523,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         max_cache_length = past_key_values._seen_tokens - self.get_action_dim(unnorm_key) + 1
         past_key_values.crop(max_length=max_cache_length)
         
-        last_caches = {"past_key_values": past_key_values, "attentions": attentions[0]}
+        # output_attentions=False(B0)이면 attentions가 None
+        last_caches = {"past_key_values": past_key_values, "attentions": attentions[0] if attentions is not None else None}
         generated_ids = results.sequences
 
         # Extract predicted action tokens and translate into (normalized) continuous actions

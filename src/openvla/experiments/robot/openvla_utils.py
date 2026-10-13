@@ -369,33 +369,52 @@ def process_image(image, crop_scale=0.9, batch_size=1):
     return image
 
 def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_key, center_crop=False, last_caches=None):
-    """Generates an action with the VLA policy."""
+    """
+    Generates an action with the VLA policy.
+
+    구간별 시간(ms)을 vla._step_timing 에 남긴다 (run_libero_eval.py가 읽음).
+      preproc_ms  : CPU 이미지 전처리 = 현재 이미지 변환 + center crop + processor(토큰화·정규화·GPU 전송)
+      select_ms   : VLA-Cache 재사용 토큰 고르기 (V만). 이전 프레임 crop + 정적 패치 + task 관련 제외 + 레이어 비율
+      generate_ms : vla.predict_action() 전체 (비전 인코더 + 언어모델 프리필/디코드 + action 디코딩)
+    CPU 구간은 GPU가 비어 있는 시점에 재므로 perf_counter로 충분하다.
+    predict_action은 내부에서 결과를 .cpu()로 가져오므로 끝나는 시점에 GPU 작업도 끝나 있다.
+    """
+    verbose = getattr(cfg, "verbose", True)
+    _now = time.perf_counter
+
+    # ---------- 전처리 (1/2): 현재 이미지 ----------
+    t0 = _now()
     image = Image.fromarray(obs["full_image"])
     image = image.convert("RGB")
-    
-    result_image = image
-    prev_image = Image.fromarray(obs["prev_image"])
-    prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
-    prev_attn = last_caches['attentions'] if last_caches is not None else None
-    mask_indices = None
-    vla.language_model.config.proportion_attn_var = None
-
-
     # (If trained with image augmentations) Center crop image and then resize back up to original size.
     # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
     #            the original height and width by sqrt(0.9) -- not 0.9!
     if center_crop:
         image = process_image(image)
-        prev_image = process_image(prev_image)
+    preproc_s = _now() - t0
 
+    result_image = image
+    prompt_cache = last_caches["past_key_values"] if last_caches is not None else None
+    prev_attn = last_caches["attentions"] if last_caches is not None else None
+    mask_indices = None
+    vla.language_model.config.proportion_attn_var = None
+
+    # ---------- select: 재사용 토큰 고르기 (VLA-Cache) ----------
+    select_s = 0.0
     if cfg.use_vla_cache:
-        print(">> VLA-Cache inference mode")
-        # Step 1: Identify visually stable patches across frames
-        if prompt_cache is not None:
+        if verbose:
+            print(">> VLA-Cache inference mode")
+        t1 = _now()
+        if prompt_cache is not None and prev_attn is not None:
+            # 이전 프레임은 VLA-Cache 비교에만 쓰므로 여기서만 crop한다 (캐시를 끈 기준선은 이 비용이 없음)
+            prev_image = Image.fromarray(obs["prev_image"])
+            if center_crop:
+                prev_image = process_image(prev_image)
+
+            # Step 1: Identify visually stable patches across frames
             stable_patches = find_static_patches(image, prev_image, top_k=130)
 
-        # Step 2: Use prior attention to filter out task-relevant tokens
-        if prev_attn is not None:
+            # Step 2: Use prior attention to filter out task-relevant tokens
             result_image, remaining_static_tokens_indices = task_relevant_selection(
                 prev_attn, image, stable_patches
             )
@@ -404,16 +423,24 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
 
             vla.language_model.config.reusable_patches = mask_indices
-            vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn) if mask_indices is not None else None
-
+            # 재사용 후보가 0개면 재사용을 끈다 (None이면 modeling_llama에서 len(None) 에러)
+            vla.language_model.config.proportion_attn_var = (
+                get_layer_mask_schedule(prev_attn) if mask_indices is not None else None
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        select_s = _now() - t1
     else:
-        print(">> VLA-Cache disabled")
+        if verbose:
+            print(">> VLA-Cache disabled")
         prompt_cache = None
         mask_indices = None
 
     if prompt_cache is None:
         prompt_cache = DynamicCache()
-        
+
+    # ---------- 전처리 (2/2): 프롬프트 + processor ----------
+    t2 = _now()
     # Build VLA prompt
     if "openvla-v01" in base_vla_name:  # OpenVLA v0.1
         prompt = (
@@ -424,10 +451,21 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
 
     # Process inputs.
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+    preproc_s += _now() - t2
 
-    # Get action.
-    action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
-                                                        output_attentions = True, past_key_values=prompt_cache)
-   
+    # ---------- generate: 모델 실행 ----------
+    # B0: 캐시 끔 + 어텐션 출력 끔 / B1: 캐시 끔 + 어텐션 출력 켬 / V: 캐시 켬 (어텐션 출력 필수)
+    output_attentions = True if cfg.use_vla_cache else getattr(cfg, "output_attentions", True)
+    t3 = _now()
+    action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True,
+                                             output_attentions=output_attentions, past_key_values=prompt_cache)
+    generate_s = _now() - t3
+
+    vla._step_timing = {
+        "preproc_ms": preproc_s * 1000.0,
+        "select_ms": select_s * 1000.0,
+        "generate_ms": generate_s * 1000.0,
+    }
+
     result_image = np.array(result_image)
     return action, last_caches, result_image
