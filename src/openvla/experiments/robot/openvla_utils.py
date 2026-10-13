@@ -8,7 +8,7 @@ from datetime import datetime
 import filecmp
 import shutil
 import numpy as np
-import tensorflow as tf
+# [thor] import tensorflow as tf
 import torch
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
@@ -21,6 +21,7 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
 from .vla_cache_utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
+from experiments.robot.tf_free import process_image  # [thor] TF-free replacement
 
 from transformers import DynamicCache
 
@@ -301,72 +302,9 @@ def get_processor(cfg):
     return processor
 
 
-def crop_and_resize(image, crop_scale, batch_size):
-    """
-    Center-crops an image to have area `crop_scale` * (original image area), and then resizes back
-    to original size. We use the same logic seen in the `dlimp` RLDS datasets wrapper to avoid
-    distribution shift at test time.
+# [thor] TF 기반 crop_and_resize / process_image 는 experiments/robot/tf_free.py 의 process_image 로 대체.
+#        center crop(넓이 90%) 후 bilinear로 224 복원하는 TF 계산을 numpy로 그대로 옮겼다.
 
-    Args:
-        image: TF Tensor of shape (batch_size, H, W, C) or (H, W, C) and datatype tf.float32 with
-               values between [0,1].
-        crop_scale: The area of the center crop with respect to the original image.
-        batch_size: Batch size.
-    """
-    # Convert from 3D Tensor (H, W, C) to 4D Tensor (batch_size, H, W, C)
-    assert image.shape.ndims == 3 or image.shape.ndims == 4
-    expanded_dims = False
-    if image.shape.ndims == 3:
-        image = tf.expand_dims(image, axis=0)
-        expanded_dims = True
-
-    # Get height and width of crop
-    new_heights = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
-    new_widths = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
-
-    # Get bounding box representing crop
-    height_offsets = (1 - new_heights) / 2
-    width_offsets = (1 - new_widths) / 2
-    bounding_boxes = tf.stack(
-        [
-            height_offsets,
-            width_offsets,
-            height_offsets + new_heights,
-            width_offsets + new_widths,
-        ],
-        axis=1,
-    )
-
-    # Crop and then resize back up
-    image = tf.image.crop_and_resize(image, bounding_boxes, tf.range(batch_size), (224, 224))
-
-    # Convert back to 3D Tensor (H, W, C)
-    if expanded_dims:
-        image = image[0]
-
-    return image
-
-def process_image(image, crop_scale=0.9, batch_size=1):
-    
-    # Convert to TF Tensor and record original data type (should be tf.uint8)
-    image = tf.convert_to_tensor(np.array(image))
-    orig_dtype = image.dtype
-
-    # Convert to data type tf.float32 and values between [0,1]
-    image = tf.image.convert_image_dtype(image, tf.float32)
-
-    # Crop and then resize back to original size
-    image = crop_and_resize(image, crop_scale, batch_size)
-
-    # Convert back to original data type
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
-
-    # Convert back to PIL Image
-    image = Image.fromarray(image.numpy())
-    image = image.convert("RGB")
-
-    return image
 
 def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_key, center_crop=False, last_caches=None):
     """

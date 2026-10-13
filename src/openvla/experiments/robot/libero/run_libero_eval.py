@@ -455,6 +455,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
         assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
     processor = get_processor(cfg) if cfg.model_family == "openvla" else None
 
+    # 실제로 쓰이는 어텐션 구현 (sdpa / eager / flash_attention_2)
+    attn_impl = getattr(model.language_model.config, "_attn_implementation", None)
+    print(f"[attn] language model attention implementation: {attn_impl}")
+
     scheduler = ActionScheduler(cfg.z_xy_rate_skip, cfg.z_max_skip, cfg.step_skip,
                                 cfg.action_buffer_size, cfg.min_generate_ratio)
     timer = StageTimer(model)
@@ -485,7 +489,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     resize_size = get_image_resize_size(cfg)
     max_steps = MAX_STEPS[cfg.task_suite_name]
-    log_file.write(f"Task suite: {cfg.task_suite_name} | cond: {cond}\n")
+    log_file.write(f"Task suite: {cfg.task_suite_name} | cond: {cond} | attn_implementation: {attn_impl}\n")
 
     # 집계용
     total_episodes, total_successes = 0, 0
@@ -643,6 +647,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     csv_file.close()
     summary = summarize(cfg, cond, all_rows, total_episodes, total_successes, per_task_success,
                         total_env_steps, total_episode_time, num_layers)
+    summary["attn_implementation"] = attn_impl
 
     print("\n===== SUMMARY =====")
     for k, v in summary.items():
