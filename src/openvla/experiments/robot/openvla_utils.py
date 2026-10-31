@@ -20,7 +20,14 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
-from .vla_cache_utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
+from .vla_cache_utils import (
+    find_static_patches,
+    task_relevant_selection,
+    get_layer_mask_schedule,
+    task_relevant_selection_from_scores,
+    get_layer_mask_schedule_from_entropies,
+)
+from .vla_cache_attn_stats import RECORDER, install_attn_stats_patch
 from experiments.robot.tf_free import process_image  # [thor] TF-free replacement
 
 from transformers import DynamicCache
@@ -264,9 +271,13 @@ def get_vla(cfg):
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
 
+    # [lite] attention 통계 기록용으로 LlamaSdpaAttention.forward 교체 (모델 로드 전에 적용)
+    install_attn_stats_patch()
+
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
         # attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",  # [lite] 교체한 SDPA forward가 쓰이도록 명시
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
@@ -316,8 +327,15 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
       generate_ms : vla.predict_action() 전체 (비전 인코더 + 언어모델 프리필/디코드 + action 디코딩)
     CPU 구간은 GPU가 비어 있는 시점에 재므로 perf_counter로 충분하다.
     predict_action은 내부에서 결과를 .cpu()로 가져오므로 끝나는 시점에 GPU 작업도 끝나 있다.
+
+    attn_stats (cfg, 기본 "lite"):
+      "full" : 원래 방식. generate(output_attentions=True)로 32개 레이어 attention map 전체를 받는다.
+      "lite" : output_attentions=False. 프리필에서만 레이어별 엔트로피 + 15번 레이어 text→vision 점수를 기록한다.
+               디코드 6번은 SDPA로 돈다. 다음 스텝의 재사용 결정은 "full"과 같은 식으로 계산된다.
     """
     verbose = getattr(cfg, "verbose", True)
+    attn_stats_mode = getattr(cfg, "attn_stats", "lite")
+    use_lite = cfg.use_vla_cache and attn_stats_mode == "lite"
     _now = time.perf_counter
 
     # ---------- 전처리 (1/2): 현재 이미지 ----------
@@ -333,17 +351,20 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
 
     result_image = image
     prompt_cache = last_caches["past_key_values"] if last_caches is not None else None
-    prev_attn = last_caches["attentions"] if last_caches is not None else None
+    prev_attn = last_caches.get("attentions") if last_caches is not None else None     # full
+    prev_stats = last_caches.get("attn_stats") if last_caches is not None else None    # lite
+    prev_signal = prev_stats if use_lite else prev_attn
     mask_indices = None
+    vla.language_model.config.reusable_patches = None
     vla.language_model.config.proportion_attn_var = None
 
     # ---------- select: 재사용 토큰 고르기 (VLA-Cache) ----------
     select_s = 0.0
     if cfg.use_vla_cache:
         if verbose:
-            print(">> VLA-Cache inference mode")
+            print(f">> VLA-Cache inference mode (attn_stats={attn_stats_mode})")
         t1 = _now()
-        if prompt_cache is not None and prev_attn is not None:
+        if prompt_cache is not None and prev_signal is not None:
             # 이전 프레임은 VLA-Cache 비교에만 쓰므로 여기서만 crop한다 (캐시를 끈 기준선은 이 비용이 없음)
             prev_image = Image.fromarray(obs["prev_image"])
             if center_crop:
@@ -353,21 +374,34 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             stable_patches = find_static_patches(image, prev_image, top_k=130)
 
             # Step 2: Use prior attention to filter out task-relevant tokens
-            result_image, remaining_static_tokens_indices = task_relevant_selection(
-                prev_attn, image, stable_patches
-            )
+            if use_lite:
+                result_image, remaining_static_tokens_indices = task_relevant_selection_from_scores(
+                    prev_stats["tv_score"], image, stable_patches
+                )
+            else:
+                result_image, remaining_static_tokens_indices = task_relevant_selection(
+                    prev_attn, image, stable_patches
+                )
 
             # Step 3: Merge remaining static token indices and update model config
             mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
 
-            vla.language_model.config.reusable_patches = mask_indices
-            # 재사용 후보가 0개면 재사용을 끈다 (None이면 modeling_llama에서 len(None) 에러)
-            vla.language_model.config.proportion_attn_var = (
-                get_layer_mask_schedule(prev_attn) if mask_indices is not None else None
-            )
+            if mask_indices is not None:
+                vla.language_model.config.reusable_patches = mask_indices
+                vla.language_model.config.proportion_attn_var = (
+                    get_layer_mask_schedule_from_entropies(prev_stats["entropies"])
+                    if use_lite
+                    else get_layer_mask_schedule(prev_attn)
+                )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         select_s = _now() - t1
+
+        # 재사용할 토큰이 없으면 이전 캐시를 넘기지 않고 새 캐시로 전부 다시 계산한다.
+        # (proportion_attn_var=None인데 꽉 찬 캐시를 넘기면 포크의 LlamaModel이 cache_position을 N~2N으로 잡아
+        #  index_copy_가 캐시 범위를 벗어난다)
+        if mask_indices is None:
+            prompt_cache = None
     else:
         if verbose:
             print(">> VLA-Cache disabled")
@@ -392,12 +426,26 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     preproc_s += _now() - t2
 
     # ---------- generate: 모델 실행 ----------
-    # B0: 캐시 끔 + 어텐션 출력 끔 / B1: 캐시 끔 + 어텐션 출력 켬 / V: 캐시 켬 (어텐션 출력 필수)
-    output_attentions = True if cfg.use_vla_cache else getattr(cfg, "output_attentions", True)
+    # B0: 캐시 끔 + 어텐션 출력 끔 / B1: 캐시 끔 + 어텐션 출력 켬
+    # V (full): 캐시 켬 + 어텐션 출력 켬 / V (lite): 캐시 켬 + 어텐션 출력 끔, 프리필 통계만 기록
+    if cfg.use_vla_cache:
+        output_attentions = not use_lite
+    else:
+        output_attentions = getattr(cfg, "output_attentions", True)
+
     t3 = _now()
-    action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True,
-                                             output_attentions=output_attentions, past_key_values=prompt_cache)
+    if use_lite:
+        RECORDER.start()
+    try:
+        action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True,
+                                                 output_attentions=output_attentions, past_key_values=prompt_cache)
+    finally:
+        stats = RECORDER.stop() if use_lite else None
     generate_s = _now() - t3
+
+    if use_lite:
+        last_caches["attn_stats"] = stats
+        last_caches["attentions"] = None
 
     vla._step_timing = {
         "preproc_ms": preproc_s * 1000.0,

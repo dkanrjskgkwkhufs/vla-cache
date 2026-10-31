@@ -115,6 +115,7 @@ class GenerateConfig:
     use_vla_cache: bool = True                       # VLA-Cache: 정적 토큰 KV 재사용
     use_step_skip: bool = True                       # SP-VLA: action 재사용 (step skipping)
     output_attentions: bool = True                   # 캐시를 끈 경우만 의미 있음 (False=C0, True=B1)
+    attn_stats: str = "lite"                         # VLA-Cache 켠 경우: "lite"=SDPA+프리필 통계만, "full"=원래 eager attention map 전체
     fork_profiling: bool = False                     # transformers 포크 안의 synchronize/print 사용 (False 권장)
 
     # Step skipping 하이퍼파라미터 (None이면 SKIP_PARAMS의 suite 기본값 사용)
@@ -489,7 +490,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     resize_size = get_image_resize_size(cfg)
     max_steps = MAX_STEPS[cfg.task_suite_name]
-    log_file.write(f"Task suite: {cfg.task_suite_name} | cond: {cond} | attn_implementation: {attn_impl}\n")
+    log_file.write(f"Task suite: {cfg.task_suite_name} | cond: {cond} | attn_implementation: {attn_impl} | attn_stats: {cfg.attn_stats}\n")
 
     # 집계용
     total_episodes, total_successes = 0, 0
@@ -648,6 +649,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     summary = summarize(cfg, cond, all_rows, total_episodes, total_successes, per_task_success,
                         total_env_steps, total_episode_time, num_layers)
     summary["attn_implementation"] = attn_impl
+    summary["attn_stats"] = cfg.attn_stats
 
     print("\n===== SUMMARY =====")
     for k, v in summary.items():

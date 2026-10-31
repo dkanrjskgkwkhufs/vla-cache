@@ -173,3 +173,55 @@ def task_relevant_selection(multihead_attention, image, significant_patches, top
     remaining = sorted([pid + v_token_start for pid in only_significant])
 
     return np.array(result_image), remaining
+
+
+# =====================================================================================================================
+# attn_stats="lite" 용: attention map 전체 대신 vla_cache_attn_stats.py가 기록한 통계로 같은 결과를 만든다
+# =====================================================================================================================
+@torch.no_grad()
+def get_layer_mask_schedule_from_entropies(entropies, apply_weighted_growth=True, growth_factor=0.55):
+    """
+    get_layer_mask_schedule과 같은 결과. 엔트로피 계산은 이미 끝난 상태로 받는다.
+
+    Args:
+        entropies (Tensor): 레이어별 평균 토큰 엔트로피, shape (num_layers,).
+    """
+    device = entropies.device
+    norm_entropy = (entropies - entropies.min()) / (entropies.max() - entropies.min() + 1e-10)
+    reuse = 1.0 - norm_entropy
+
+    if apply_weighted_growth:
+        reuse = reuse.tolist()
+        for i in range(1, len(reuse)):
+            delta = reuse[i] - reuse[i - 1]
+            if delta > 0:
+                reuse[i] = reuse[i - 1] + delta * growth_factor
+        reuse = torch.tensor(reuse, dtype=torch.float32, device=device)
+
+    return reuse
+
+
+def task_relevant_selection_from_scores(attn_score, image, significant_patches, top_k=120):
+    """
+    task_relevant_selection과 같은 결과. token_attention_merge 결과(256개 점수)를 바로 받는다.
+    """
+    top_patches = get_top_attention_patches(attn_score, top_k)
+
+    only_significant = set(significant_patches) - set(top_patches)
+    only_top = set(top_patches) - set(significant_patches)
+    overlap = set(significant_patches) & set(top_patches)
+
+    patch_groups = [
+        (significant_patches, (15, 67, 223)),
+        (top_patches, (254, 55, 13)),
+        (only_significant, (40, 116, 166)),
+        (only_top, (241, 196, 15)),
+        (overlap, (231, 76, 60)),
+    ]
+
+    result_image = draw_patches_overlay(image, patch_groups, patch_size=14, alpha=0.4)
+
+    v_token_start = 1
+    remaining = sorted([pid + v_token_start for pid in only_significant])
+
+    return np.array(result_image), remaining
